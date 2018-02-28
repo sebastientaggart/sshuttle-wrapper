@@ -1,0 +1,261 @@
+#!/bin/bash
+
+# Set the correct working directory so this script can be executed anywhere
+cd $(cd -P -- "$(dirname -- "$0")" && pwd -P)
+set -o errexit
+set -o pipefail
+
+# Utility Variables
+# OK means something happened, and the script is informing you
+# FAIL means something went wrong, and tells you why
+# INFO is informational, no action was taken
+OK=$(tput setaf 2)'[OK]'$(tput sgr0) # pretty green [OK]
+FAIL=$(tput setaf 1)'[FAIL]'$(tput sgr0) # ugly red [FAIL]
+INFO=$(tput setaf 6)'[INFO]'$(tput sgr0) # grey [INFO]
+
+# This script is based on https://github.com/teohm/dotfiles/blob/master/public/.functions.d/sshuttle.bash
+# Except that here we use a pre-defined set of hostnames that we forward
+# We also use a pre-set SSH user/key combination
+
+#########################
+# The command line help #
+#########################
+display_help() {
+    echo "Purpose: initiates ssh tunnel to predefined list of hostnames."
+    echo
+    echo "Usage: tunnel [option...]" >&2
+    echo
+    echo "   --start, start                Start the tunneling service.        "
+    echo "   --stop, stop                  Stop the tunneling service.         "
+    echo "   --start-all, start-all        Starts tunneling on ALL hosts.      "
+    echo "   --restart, restart            Restart the tunneling service.      "
+    echo "   --status, status              Report whether a tunnel is active   "
+    echo "   --cleanup, cleanup            Reset list of IP addresses          "
+    echo "   --help, help                  Show this help screen :)            "
+    echo "   --test, test                  Test a specific address (required)  "
+    echo "   --testall, testall            Test all preconfigured addresses    "
+    echo "   "
+    echo
+    exit 1
+}
+
+if [ ${1:-false} == '--help' ] || [ ${1:-false} == '-h' ] || [ ${1:-false} == 'help' ]; then
+  # Just show help and exit
+  display_help
+  exit 0
+fi
+
+# Verify that file permissions are correct
+chmod 400 scripts/tunnel_key
+chmod 400 scripts/tunnel_key.pub
+
+# Check if sshuttle is installed, if not, install it
+if ! $(brew list | grep -q 'sshuttle'); then
+  printf "${FAIL} sshuttle is not installed.  Attempting to install automatically...\n"
+  brew install sshuttle
+fi
+
+# Specify the user@IP tunnel target
+TNL_SERVER=user@11.22.33.44:22
+# Space-separated list of hosts to forward
+TNL_HOSTS='google.com github.com'
+# temp file to track list of IP addresses found
+# (this is necessary because hosts often have multiple edge IPs)
+IP_TEMP_FILE='/tmp/sshuttle-ip-addresses.txt'
+
+# Specify default command if none is passed
+COMMAND=start
+
+if [ "$#" -ge 1 ]; then
+  case ${1} in
+    start | --start)
+      COMMAND=start
+      ;;
+    start-all | --start-all)
+      COMMAND=startall
+      ;;
+    stop | --stop)
+      COMMAND=stop
+      ;;
+    restart | --restart)
+      COMMAND=restart
+      ;;
+    status | --status)
+      COMMAND=status
+      ;;
+    cleanup | --cleanup)
+      COMMAND=cleanup
+      ;;
+    test | --test)
+      COMMAND=test
+      ;;
+    testall | --testall)
+      COMMAND=testall
+      ;;
+    --help | -h)
+      display_help
+      exit 0
+      ;;
+    # Any argument but those above is invalid, so error out
+    *)
+      printf "${FAIL} Argument not valid, try --help\n"
+      exit 1
+      ;;
+  esac
+fi
+
+# returns a list of IP addresses from given domain(s).
+#
+# Examples:
+#  dns2ip google.com
+#  dns2ip netflix.com movies.netflix.com
+#
+function dns2ip() {
+  dig +short ${TNL_HOSTS} | sed "/[^0-9\.]/d" # use sed to remove non-IPv4 line e.g. alias
+}
+
+# adds an IP address to a txt file, if it doesn't already exist
+#
+# creates ${IP_TEMP_FILE} if it does not exist
+# checks ${IP_TEMP_FILE}, if not present, adds IP
+#
+# Example:
+#  add_ip 1.2.3.4
+#
+function add_ip {
+  if [[ ! -f ${IP_TEMP_FILE} ]]; then
+    touch ${IP_TEMP_FILE}
+  fi
+
+  # Look for the current IP in the tracking file, if not found, add it
+  if ! grep -q ${1} ${IP_TEMP_FILE}; then
+    # IP found, do nothing
+    echo ${1} >> ${IP_TEMP_FILE}
+    printf "${INFO} Added ${1} to forwarding list.\n"
+  fi
+}
+
+# check to see if a given address is being routed correctly through sshuttle
+# NOTE: $1 argument is required
+# returns 0 for success, 1 for failure, for quiet tests
+#
+# Examples:
+#   testaddress google.com
+#   testaddress https://www.netflix.com
+#   if testaddress google.com; then BLAH BLAh (silently test for 200)
+#
+# If we get HTTP/1.1 403 Forbidden then we are being blocked
+# If we get HTTP/2 200 then forwarding is working, and we should be able to access the site
+#
+function testaddress() {
+  if ! [ "$#" -ge 1 ]; then
+    printf "${FAIL} required argument not passed to testaddress() function!\n"
+    return 1
+  else
+    #CURLTEST=$(curl -ILs $1)
+    if curl -ILs $1 | grep -q ' 200'; then
+      printf "${OK} $1 returned HTTP 200.  Looks good.\n"
+      return 0
+    elif curl -ILs $1 | grep -q ' 403'; then
+      printf "${FAIL} $1 returned 403 Forbidden.  Routing is not enabled.\n"
+      return 1
+    else
+      printf "${FAIL} $1 did not return 200 or 403, here is the full output:\n"
+      #echo ${CURLTEST} # TODO: reduce curl calls by one, but this echo only returns the first line
+      curl -ILs $1
+      return 1
+    fi
+  fi
+}
+
+if [ ${COMMAND} = start ]; then
+  if [[ -f /tmp/sshuttle.pid ]]; then
+    printf "${FAIL} tunnel is already running!  --start aborted\n"
+  else
+    printf "${INFO} Attempting to initiate tunnel (this will ask for your system password)...\n"
+    # Connection using list of IP addresses collected into a temp file, from add_ip()
+    for IP in `dns2ip`
+    do
+      add_ip ${IP}
+    done
+    IPS_TO_FORWARD=`cat ${IP_TEMP_FILE}`
+    sshuttle -D --pidfile=/tmp/sshuttle.pid -r ${TNL_SERVER} ${IPS_TO_FORWARD} --ssh-cmd 'ssh -i scripts/tunnel_key'
+    printf "${OK} Tunnel started successfully for the following hosts:\n"
+    for url in ${TNL_HOSTS}
+    do
+      printf "   https://${url}\n"
+    done
+    # After a successful connection, scan all hosts and add additional (changed) IPS
+    for IP in `dns2ip`
+    do
+      add_ip ${IP}
+    done
+    printf "${INFO} Scan for IP address changes complete!  If forwarding fails, try: \n       tunnel restart\n"
+  fi
+fi
+
+if [ ${COMMAND} = startall ]; then
+  if [[ -f /tmp/sshuttle.pid ]]; then
+    printf "${FAIL} tunnel is already running!  --start aborted\n"
+  else
+    printf "${INFO} Attempting to initiate tunnel (this will ask for your system password)...\n"
+    sshuttle -D --pidfile=/tmp/sshuttle.pid --remote=tunnel@70.33.177.28:22 0/0 --ssh-cmd 'ssh -i scripts/tunnel_key'
+    printf "${OK} Tunnel started successfully for _ALL_ hosts.\n"
+  fi
+fi
+
+if [ ${COMMAND} = stop ]; then
+  if [[ -f /tmp/sshuttle.pid ]]; then
+    printf "${INFO} Stopping tunnel...\n"
+    kill `cat /tmp/sshuttle.pid`
+  else
+    printf "${FAIL} tunnel is not running!  --stop aborted.\n"
+  fi
+fi
+
+if [ ${COMMAND} = restart ]; then
+  # Simply calls itself, shortcut for tunnel stop && tunnel start
+  $0 stop
+  $0 start
+fi
+
+if [ ${COMMAND} = status ]; then
+  if [[ -f /tmp/sshuttle.pid ]]; then
+    printf "${OK} Tunnel is active on the following hosts: \n"
+    for url in ${TNL_HOSTS}
+    do
+      printf "   https://${url}\n"
+    done
+    FORWARDED_IPS=`cat ${IP_TEMP_FILE}`
+    printf "${INFO} The following IP addresses are being forwarded: \n${FORWARDED_IPS}\n"
+  else
+    printf "${FAIL} Tunnel is not running.\n"
+  fi
+fi
+
+if [ ${COMMAND} = cleanup ]; then
+  # Delete the tracking file for list of IPs to forward
+  if [[ -f ${IP_TEMP_FILE} ]]; then
+    rm ${IP_TEMP_FILE}
+  fi
+  printf "${INFO} Cleanup complete!\n"
+fi
+
+if [ ${COMMAND} = test ]; then
+  if ! [ "$#" -ge 2 ]; then
+    printf "${FAIL} you must supply an address to test, e.g. tunnel test google.com\n"
+  else
+    testaddress $2
+    # Also possible to test this silently:
+    # if testaddress google.com; then
+    #   # address silently tested as good!
+    # fi
+  fi
+fi
+
+if [ ${COMMAND} = testall ]; then
+  for url in ${TNL_HOSTS}
+  do
+    testaddress $url
+  done
+fi
